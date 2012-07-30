@@ -1,0 +1,676 @@
+<html>
+
+<h1>Off-the-Record Messaging with libotr</h1>
+
+<p>
+  A commonly used method for sending messages to others when you need
+  authentication and privacy is to use an OpenPGP tool such as GNU
+  Privacy Guard (GnuPG). For real time communications such as instant
+  messaging, IRC, and socket IO, using Off The Record (OTR) messaging
+  provides <a
+  href="http://en.wikipedia.org/wiki/Perfect_forward_secrecy">Perfect
+  Forward Secrecy</a> and secure identification of the remote party
+  without the need for a web of trust.
+</p>
+
+<p>
+  In order to operate without a web of trust <a
+  href="http://www.cypherpunks.ca/otr/">libotr</a> implements the
+  Socialist Millionaires' Protocol (SMP). The SMP allows two parties
+  to verify that they both know the same secret. The secret might be a
+  passphrase or answer to a private joke that two people will easily
+  know. The SMP operates fine in the presence of eaves droppers (who
+  don't get to learn the secret). Active communications tampering is
+  not a problem, though of course it might cause the protocol not to
+  complete succesfully.
+</p>
+
+<p>
+  Because the SMP doesn't rely on the fingerprint of the user's
+  private key for authentication, the private key becomes almost an
+  implementation detail. Once generated, the user generally doesn't
+  need to know about the key or it's fingerprint. The only time a user
+  really cares to know is when a key is created because a bit of
+  entropy has to go into that process. Of course, an application
+  should avoid regenerating keys for no reason because each time the
+  key is replaced the user has to use the SMP again to allow remote
+  parties to authenticate them.
+</p>
+
+<p>
+  In this article I'll show you how to use the current release, libotr
+  3.2.0+, to provide OTR messaging. I'll present two examples which
+  are both in C++ and use the boost library for socket IO. I have gone
+  this was so we can focus on the OTR action and not the details of
+  sockets.
+</p>
+
+<p>
+  The first example does not use the Socialist Millionaires' Protocol
+  (SMP). So the new_fingerprint() callback is essential to
+  establishing a secure session. When not using the SMP,
+  authentication is performed by comparing the sent fingerprints of
+  those you are wishing to communicate with against known good values.
+  These known values must be sent beforehand through a secure
+  secondary channel, such as a face to face meeting. Once fingerprints
+  have been accepted, subsequent OTR comminications with the same
+  party can be performed without explicit fingerprint verification.
+</p>
+
+<p>
+  The second example makes things simpler for the user by using the
+  SMP for authentication of the remote party. This way, the
+  information exchanged beforehand becomes shared experiences you and
+  the other party have had such that a question can be raised that
+  only you and they can easily answer.
+</p>
+
+<p>
+  A central abstraction in using the libotr library is the struct
+  s_OtrlMessageAppOps vtable. This is used by libotr to callback into
+  your code when something happens such as a crytpographic fingerprint
+  being received, or libotr wanting to send a message to the other
+  end. The later happens frequently during OTR session establishment.
+</p>
+
+<p>
+  If a program monitors it's socket IO using select() or some other
+  mainloop abstraction, then having these internal protocol messages
+  being sent is not so much of an issue. Alas, for the simple echo
+  server I present one must remember that there might be one or more
+  internal OTR protocol messages sent from what seems like outside of
+  the normal program flow. I'll get back to this point while
+  describing the relevant section of the first example.
+</p>
+
+<p>
+  Many of the callback functions in s_OtrlMessageAppOps might be
+  simple stubs, but you should be aware of inject_message() which will
+  be called when libotr itself wants to send something, notify and
+  display_otr_message can both provide feedback to the user, the
+  new_fingerprint() method is called when a remote key is discovered
+  in order to allow you to inform the user and possibly abort the
+  session. The gone_secure() method is called to allow you to inform
+  the user that they are off the record. When you call libotr
+  functions you supply both a pointer to a s_OtrlMessageAppOps
+  structure <tt>uiops</tt> and a void* <tt>opdata</tt>. When libotr calls a method
+  in uiops it will pass <tt>opdata</tt> back to you. 
+</p>
+
+<p>
+  Another common three parameters you will pass to libotr functions
+  are the accountname, protocol and sender or receiver name. The
+  protocol string can be anything as long as both ends of the system
+  use the same protocol string. The state data that libotr uses is
+  stored in an OtrlUserState object which is created with
+  otrl_userstate_create() and passed to many of the libotr functions
+  along the way.
+</p>
+
+<p>
+ The code below loads a private key or creates a new one if none
+ already exists. Because creating a new key is an entropy heavy
+ operation, the setupKey() function warns the user that if they are
+ erratic it the process might move along a bit quicker. Note that the
+ uiops has a callback create_privkey to generate a key if needed. I
+ just prefer to make this codepath explicit and out of the main
+ callback logic.
+</p>
+
+<pre>
+bool ok( gcry_error_t et )
+{
+    return gcry_err_code(et) == GPG_ERR_NO_ERROR;
+}
+
+void setupKey( const std::string& filename )
+{
+    gcry_error_t et;
+    
+    et = otrl_privkey_read( userstate, filename.c_str() );
+    if( !ok(et) )
+    {
+        cerr << "can't find existing key, generating a new one!" << endl;
+        cerr << "this needs a bunch of entropy from your machine... so please" << endl;
+        cerr << "move the mouse around and slap some keys mindlessly for a while" << endl;
+        cerr << "a message will be printed when keys have been made..." << endl;
+        et = otrl_privkey_generate( userstate, filename.c_str(),
+                                    accountname, protocol );
+        if( !ok(et) )
+        {
+            cerr << "failed to write new key file at:" << filename << endl;
+        }
+        cerr << "Have keys!" << endl;
+    }
+}
+</pre>
+
+<p>
+  The main.cpp program implements both the client and server. The
+  server mode is selected by passing -s at startup. Firstly, a
+  userstate is created, some variables set depending on if we are a
+  client or server, and the correct private key is loaded or created.
+</p>
+
+<pre>
+    OTRL_INIT;
+    userstate = otrl_userstate_create();
+
+    keyfile = "client.key";
+    accountname = "client";
+    recipientname = "server";
+    if( ServerMode )
+    {
+        keyfile = "server.key";
+        accountname = "server";
+        recipientname = "client";
+    }
+    setupKey( keyfile );
+</pre>
+
+<p>
+  The core logic for the echo client is to read a string from the user, send it to the
+  server, grab a reply from the server and show it to the user.
+  The start of the client code connects to a given port on localhost
+  and reads a string from the user.
+</p>
+
+<pre>
+        VMSG << "client mode..." << endl;
+        stringstream portss;
+        portss << Port;
+        iosockstream stream( "127.0.0.1", portss.str() );
+        if (!stream)
+        {
+            cerr << "can't connect to server!" << endl;
+            exit(1);
+        }
+
+        string s;
+        while( true )
+        {
+            getline(cin,s);
+            cerr << "your raw message:" << s << endl;
+            cerr << "send plaintext:" << colorsend(s) << endl;
+</pre>
+
+<p>
+  We certainly do not want to send the raw string <tt>s</tt> over the wire to
+  the server though. That would very much be "on the record". So the
+  next fragment of the client gets libotr to encrypt the string <tt>s</tt> so
+  we can send it off the record to the server. The userstate is the
+  value created during program initialization using
+  otrl_userstate_create(). The ui_ops is the vtable
+  s_OtrlMessageAppOps structure described above, and opdata is the
+  value we want libotr to pass back to our methods in ui_ops when it
+  uses them. In this case, we use the address of the iostream for the socket as the
+  opdata so callbacks can send and receive data on the socket if they
+  so desire. The newmessage will point to an off-the-record message
+  that the server can decrypt to read the string <tt>s</tt>. The tests on the
+  return value for message_sending() ensure that we have a new,
+  encrypted off the record message to send instead of the plaintext
+  <tt>s</tt>.
+</p>
+
+<pre>
+void* opdata = &stream;
+OtrlTLV* tlvs = 0;
+gcry_error_t et;
+char* newmessage;
+
+void* opdata = &stream;
+OtrlTLV* tlvs = 0;
+gcry_error_t et;
+char* newmessage;
+
+et = otrl_message_sending( userstate, &ui_ops, opdata,
+                           accountname, protocol, recipientname,
+                           s.c_str(), tlvs, &newmessage,
+                           myotr_add_appdata, &ui_ops );
+cerr << "encoded... ok:" << ok(et) << endl;
+if( !ok(et) )
+{
+    cerr << "OTR message_sending() failed!" << endl;
+}
+if( ok(et) && !newmessage )
+{
+    cerr << "There was no error, but an OTR message could not be made." << endl;
+    cerr << "perhaps you need to run some key authentication first..." << endl;
+}
+if( newmessage )
+{
+    VMSG << "have new OTR message:" << newmessage << endl;
+    s = newmessage;
+}
+</pre>
+
+<p>
+  Since we have replaced the plaintext <tt>s</tt> with the off the record
+  version, we send that to the server using the socket iostream and
+  then wait a moment before reading a response. The while loop is
+  slightly hairy in that it will block for new messages if we are not
+  secure. As I mentioned above, libotr can call the inject_message()
+  callback to write a new off the record message to the socket.
+  Outgoing messages will be generated and injected during session
+  establishment. There is no incoming version of inject_message() so
+  the client needs to keep reading these injected messages before it
+  tries to send another off the record message. One will find that
+  there are many messages exchanged between libotr at each end when
+  the string <tt>s</tt> is written to the socket. This only happens the first
+  time through to setup the OTR protocol.
+</p>
+
+<p>
+  When reading messages from the server, the encrypted string is read
+  and passed to otrl_message_receiving(). If the recevied message was
+  an OTR message that was sent from the other end by libotr using
+  inject_message() then otrl_message_receiving() will indicate to the
+  client that it should simply ignore this message. Otherwise a real
+  message was encrypted and sent by the server and so the client will
+  show the user the decrypted newmessage.
+</p>
+
+<pre>
+cerr << "WRITE:" << s << endl;
+stream << s << endl;
+usleep( 200 * 1000 );
+while( !secure && stream.peek() != std::iostream::traits_type::eof()
+       || secure && stream.rdbuf()->available() )
+{
+    s = "junk";
+    VMSG << "reading data from server" << endl;
+    getline(stream,s);
+    VMSG << "READ:" << s << endl;
+
+    int ignore_message = otrl_message_receiving(
+        userstate, &ui_ops, opdata,
+        accountname, protocol, recipientname,
+        s.c_str(),
+        &newmessage,
+        &tlvs,
+        myotr_add_appdata, &ui_ops );
+
+    VMSG << "ignore:" << ignore_message << " newmsg:" << maybenull(newmessage) << endl;
+    if( ignore_message )
+    {
+        VMSG << "libotr told us to ignore this message..." << endl;
+        VMSG << "available:" << stream.rdbuf()->available() << endl;
+        VMSG << " in_avail:" << stream.rdbuf()->in_avail() << endl;
+        
+        continue;
+    }
+    if( newmessage )
+        s = newmessage;
+    otrl_message_free( newmessage );
+
+    cout << color( s ) << endl;
+}
+</pre>
+
+<p>
+  Server mode is handled by a thread which executes server_session()
+using the std::iostream for the new socket. 
+</p>
+
+<pre>
+if( ServerMode )
+{
+    VMSG << "server mode..." << endl;
+
+    boost::asio::io_service io_service;
+    tcp::acceptor a( io_service, tcp::endpoint( tcp::v4(), Port ));
+    for (;;)
+    {
+        h_iosockstream stream(new iosockstream());
+        a.accept( *(stream->rdbuf()) );
+        boost::thread t(boost::bind(server_session, stream));
+    }
+}
+</pre>
+
+<p>
+The server implementation would look like the below if OTR messaging
+was not being used.
+</p>
+
+<pre>
+void server_session( h_iosockstream streamptr )
+{
+    iosockstream& stream = *(streamptr.get());
+    while( stream )
+    {
+       std::string s;
+       getline( stream,s );
+       cout << "server got:" << s << endl;
+       stream << s << endl;
+    }
+}
+</pre>
+
+<p>
+  The OTR server implementation starts out the same way, reading a
+  string from the socket. Then our old friend otrl_message_receiving()
+  is called to decrypt that message. If ignore_message is set then
+  there is nothing to be done and we simply continue to the top of the
+  loop to read another string from the client. Also, if we are not yet
+  secure, there is no point in trying to send a new OTR message back
+  to the client, so we simply continue at the top of the while loop
+  again. This way we avoid writing replies to the client when session
+  establishment messages are sent by libotr on the client side.
+</p>
+
+<p>
+  This might seem a little strange at first, how will we ever become
+  secure and start replying to the client if all we do is read from
+  them and throw away the messages. The thing to keep in mind is that
+  messages sent with inject_message() on the client will be seen by
+  libotr when we call otrl_message_receiving() which in turn might
+  cause libotr on the server to inject_message() with a reply to this
+  session establishment message. Eventually libotr will call the
+  gone_secure() OtrlMessageAppOps callback in which we set the global
+  variable <tt>secure</tt> to true, this allowing the server to start replying to the
+  client as it normally would.
+</p>
+
+<pre>
+void server_session( h_iosockstream streamptr )
+{
+    iosockstream& stream = *(streamptr.get());
+    while( stream )
+    {
+        gcry_error_t et;
+	std::string s;
+	VMSG << "getting more data from the client..." << endl;
+	getline( stream,s );
+	VMSG << "READ:" << s << endl;
+                    
+	void* opdata = &stream;
+	OtrlTLV* tlvs = 0;
+	char *newmessage = NULL;
+	int ignore_message = otrl_message_receiving(
+	   userstate, &ui_ops, opdata,
+	   accountname, protocol, recipientname,
+	   s.c_str(),
+	   &newmessage,
+	   &tlvs,
+	   myotr_add_appdata, &ui_ops );
+
+	VMSG << "ignore:" << ignore_message << " newmsg:" << maybenull(newmessage) << endl;
+	if( newmessage )
+   	    s = newmessage;
+	otrl_message_free( newmessage );
+	if( ignore_message )
+	{
+	    VMSG << "libotr told us to ignore this message..." << endl;
+	    continue;
+	}
+                
+	cout << "ignore:" << ignore_message << " server got:" << s << endl;
+	cout << "message from client:" << color(s) << endl;
+
+	// do not echo back messages when we are establishing the session
+	if( !secure )
+	    continue;
+</pre>
+
+<p>
+  The remainder of server_session() creates the echo reply message,
+  encrypts it with otrl_message_sending() and sends the OTR message
+  over the socket.
+</p>
+
+<pre>
+  static int count = 0;
+  stringstream zz;
+  zz << "back to you s:" << s << " count:" << count++;
+  s = zz.str();
+  cout << "writing...s:" << s << endl;
+  cerr << "send plaintext:" << colorsend(s) << endl;
+
+  et = otrl_message_sending( userstate, &ui_ops, opdata,
+     accountname, protocol, recipientname,
+     s.c_str(), tlvs, &newmessage,
+     myotr_add_appdata, &ui_ops );
+  if( !ok(et) )
+  {
+     cerr << "OTR message_sending() failed!" << endl;
+  }
+  if( ok(et) && !newmessage )
+  {
+     cerr << "There was no error, but an OTR message could not be made." << endl;
+     cerr << "perhaps you need to run some key authentication first..." << endl;
+  }
+  if( newmessage )
+  {
+     VMSG << "have new OTR message:" << newmessage << endl;
+     s = newmessage;
+  }
+                
+  VMSG << "writing otr...s:" << s << endl;
+  stream << s << endl;
+</pre>
+
+
+<p>
+  As the security of the OTR messaging relies on fingerprints in the
+  first example, the new_fingerprint callback presents our fingerprint
+  and the remote fingerprint and asks the user if they want to
+  continue to establish the session or not. Unforuntately this means
+  the user has to eyeball scan the remote fingerprint against an
+  expected value they have obtained from the remote party at some
+  other time in a secure channel.
+</p>
+
+<pre>
+static void myotr_new_fingerprint( void *opdata, OtrlUserState us,
+                                   const char *accountname, const char *protocol,
+                                   const char *username, unsigned char fingerprint[20])
+{
+    cerr << "myotr_new_fingerprint(top)" << endl;
+
+    char our_fingerprint[45];
+    if( otrl_privkey_fingerprint( us, our_fingerprint, accountname, protocol) )
+    {
+        cerr << "myotr_new_fingerprint() our   human fingerprint:" << embold( our_fingerprint ) << endl;
+    }
+    
+    cerr << "myotr_new_fingerprint() their human fingerprint:"
+         << embold( fingerprint_hash_to_human( fingerprint )) << endl;
+    cerr << "do the fingerprints match at the remote end (enter YES to proceed)" << endl;
+    std::string reply;
+    getline( cin, reply );
+    if( reply != "YES" )
+    {
+        cerr << "You have chosen not to continue to talk to these people... good bye." << endl;
+        exit(0);
+    }
+}
+</pre>
+
+<h2>Simpler authentication with SMP</h2>
+
+<p>
+  The second example uses the SMP to avoid having to verify
+  fingerprints. For good measure, the fingerprints established are
+  saved and loaded to/from disk so that subsequent conversations do
+  not need any SMP or user fingerprint verification.
+</p>
+
+<p>
+  During process startup, fingerprints are read from file if they exist;
+</p>
+
+<pre>
+ std::stringstream fn;
+ fn << "fingerprints-" << accountname;
+ gcry_error_t e = otrl_privkey_read_fingerprints( userstate, fn.str().c_str(), 0, 0 );
+</pre>
+
+<p>
+  The otrl_message_sending() and otrl_message_receiving() functions
+  both have a parameter <tt>OtrlTLV *tlvs</tt>. The tlvs allow data to be
+  sent and received as sideband information that does not effect what
+  you send with libotr. The SMP uses the tlvs to communicate the
+  information that it needs in order to authenticate.
+</p>
+
+<p>
+  In server_session() the main change is a check on the tlvs variable
+  after calling otrl_message_receiving().
+</p>
+
+<pre>
+ if( tlvs )
+ {
+    handle_smp( stream, tlvs, userstate, &extended_ui_ops, opdata );
+ }
+</pre>
+
+<p>
+  The client initiates the SMP and has heavier changes to it's code.
+  After creating a iosockstream to localhost, the client calls
+  run_smp_client() to setup the OTR session and run the SMP to
+  authenticate. Apart from the call to run_smp_client() the client
+  mainloop while(true) doesn't need to change. This makes sense
+  because the SMP is normally only used at session establishment when
+  we do not know about the remote key (fingerprint) already.
+</p>
+
+<p>
+  In the run_smp_client function, the first <tt>while( !secure...</tt> loop
+  will establish an OTR session using fingerprints just like the first
+  example. This time we do not stop to ask the user to verify the
+  fingerprints, we simply record that a new fingerprint was
+  seen. This is done by setting runSMP=true to force the SMP if we are
+  using a fingerprint that we didn't already have on disk.
+</p>
+
+<p>
+   If runSMP is set then we read a secret from the user and call
+   otrl_message_initiate_smp() to get the SMP ball rolling with
+   libotr. This leads to the second <tt>while( !secure</tt> loop which will
+   stop when we are secure again.
+</p>
+
+<pre>
+void run_smp_client( iosockstream& stream )
+{
+    void* opdata = &stream;
+    OtrlTLV* tlvs = 0;
+
+    // establish session using fingerprints
+    stream << "?OTR?v2?" << endl;
+    usleep( 200 * 1000 );
+    while( !secure && stream.peek() != std::iostream::traits_type::eof() )
+        client_read_msg_from_server( stream );
+
+    if( !runSMP )
+    {
+        return;
+    }
+    
+    VMSG << "Starting the Socialist Millionaires' Protocol " << endl
+         << " to work out who the other guy is..." << endl
+         << endl;
+    VMSG << "please give me a secret that only you and the other guy know..." << endl;
+    std::string s;
+    getline( cin, s );
+    int add_if_missing = true;
+    int addedp = 0;
+    ConnContext* smpcontext = otrl_context_find( userstate,
+                                                 recipientname, accountname, protocol,
+                                                 add_if_missing, &addedp,
+                                                 myotr_add_appdata, &ui_ops );
+
+    cerr << "addedp:" << addedp << " smpcontext:" << smpcontext << endl;
+    if( !smpcontext )
+        return;
+    otrl_message_initiate_smp( userstate, &ui_ops, opdata, smpcontext,
+                               (const unsigned char*)s.c_str(), s.length() );
+
+    // we are only secure if the SMP succeeds
+    secure = 0;
+    while( !secure && stream.peek() != std::iostream::traits_type::eof() )
+        client_read_msg_from_server( stream );
+        
+    cerr << "secure:" << secure << endl;
+    if( secure == SMP_BAD )
+    {
+        cerr << "couldn't authenticate server, exiting..." << endl;
+        exit(1);
+    }
+}
+</pre>
+
+<p>
+  The client_read_msg_from_server() function calls
+  otrl_message_receiving() and checks if tlvs is set and if so calls
+  handle_smp() with that tlvs value.
+</p>
+
+<p>
+  As you see from the above, whenever a tlvs is set in the client or
+  server then handle_smp() is called. If you look at the UPGRADING
+  file in libotr 3.2.0+ you will see a skeleton code in "3.3.4.
+  Control Flow and Errors" which the handle_smp() is based on. The
+  handle_smp() function uses otrl_tlv_find() on tlvs to check for
+  internal OTR messages sent from libotr itself which describe a stage
+  in the SMP. handle_smp() is like a primitive state machine working
+  through from SMP1 (the server asking for the secret to respond to
+  the client's initial request), through to SMP3 and SMP4 which are
+  called when the protocol completes with either success or failure
+  (same or different secrets).
+</p>
+
+<pre>
+  if( tlv = otrl_tlv_find(tlvs, OTRL_TLV_SMP2))
+  {
+    if (nextMsg != OTRL_SMP_EXPECT2)
+    {
+       cerr << "smp: spurious SMP2 received, aborting" << endl;
+       otrl_message_abort_smp( userstate, ui_ops, opdata, smpcontext);
+       otrl_sm_state_free(smpcontext->smstate);
+    }
+    else
+    {
+       cerr << embold("SMP2 received, otrl_message_receiving will have sent SMP3") << endl;
+       smpcontext->smstate->nextExpected = OTRL_SMP_EXPECT4;
+    }
+  }
+</pre>
+
+<p>
+  If the secrets are proven to be the same when the SMP is used it is
+  adventagious to save the fingerprints to disk so that future
+  communications do not require user fingerprint verificaiton or the
+  SMP.
+</p>
+
+<pre>
+if(  tlv = otrl_tlv_find(tlvs, OTRL_TLV_SMP4) 
+  || tlv = otrl_tlv_find(tlvs, OTRL_TLV_SMP3))
+ {
+ if( smpcontext->smstate->sm_prog_state == OTRL_SMP_PROG_SUCCEEDED )
+   {
+     std::stringstream fn;
+     fn << "fingerprints-" << accountname;
+     gcry_error_t e = otrl_privkey_write_fingerprints( userstate, fn.str().c_str() );
+   }
+}
+</pre>
+
+<p>
+   Hopefully you are now in a better position to add libotr support to
+   your real time network programs. The full source code to these
+   programs is up on <a href="https://github.com/monkeyiq">my
+   github</a> page. Remeber, using off the record messaging doesn't
+   nessesarily mean you have something to hide, just that you have
+   nothing to show.
+</p>
+
+<p>
+</p>
+
+
+
+</html>
